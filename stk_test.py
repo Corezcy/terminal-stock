@@ -31,16 +31,33 @@ class bcolors:
         self.ENDC = ''
 
 def readData():
-    f = open('my_stock.dat', 'r')
-    stockList = f.read().split('\n')
+    # 获取当前脚本文件的绝对路径
+    current_file = os.path.abspath(__file__)
+    # 获取当前脚本所在的目录
+    current_dir = os.path.dirname(current_file)
+    # 构建 my_stock.dat 的完整路径
+    stock_file_path = os.path.join(current_dir, 'my_stock.dat')
+    
     global stocks, mystock
-    for item in stockList:
-        if item != '':
-            itemList = item.split()
-            stocks += itemList[0] + ','
-            mystock[itemList[0]] = (itemList[1], itemList[2]) if len(itemList) == 3 else None
-    stocks = stocks[:-1]
-    f.close()
+    
+    try:
+        with open(stock_file_path, 'r', encoding='utf-8') as f:
+            stockList = f.read().split('\n')
+            
+        for item in stockList:
+            if item.strip() != '':  # 使用 strip() 去除空白字符
+                itemList = item.split()
+                if len(itemList) >= 1:
+                    stocks += itemList[0] + ','
+                    mystock[itemList[0]] = (itemList[1], itemList[2]) if len(itemList) == 3 else None
+        
+        stocks = stocks[:-1]  # 去掉最后一个逗号
+        
+    except FileNotFoundError:
+        print(f"文件未找到: {stock_file_path}")
+        print(f"当前工作目录: {os.getcwd()}")
+    except Exception as e:
+        print(f"读取文件时出错: {e}")
 
 
 def getTime():
