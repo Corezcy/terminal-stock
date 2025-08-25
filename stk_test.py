@@ -45,6 +45,8 @@ def readData():
             stockList = f.read().split('\n')
             
         for item in stockList:
+            if item.startswith('#'):
+                continue  # 跳过注释行
             if item.strip() != '':  # 使用 strip() 去除空白字符
                 itemList = item.split()
                 if len(itemList) >= 1:
@@ -208,7 +210,7 @@ def printStock():
         # Print header and time
         time_str = bcolors.YELLOW + getTime() + bcolors.ENDC
         header = bcolors.WHITE + "CODE         NAME                 LATEST      CHANGE" + bcolors.ENDC
-        separator = bcolors.WHITE + "=" * 100 + bcolors.ENDC
+        separator = bcolors.WHITE + "=" * 55 + bcolors.ENDC
         
         print(f"{time_str:<120}")  # Fixed width to overwrite previous time
         print(f"{header:<120}")
