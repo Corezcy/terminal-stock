@@ -37,11 +37,7 @@ def normalize_stock_code(code):
     if not raw:
         return ""
 
-    if raw.startswith(("sh", "sz", "bj")):
-        prefix = raw[:2]
-        digits = raw[2:]
-        if digits.isdigit():
-            return f"{prefix}{digits.zfill(6)}"
+    if raw.startswith(("sh", "sz", "bj", "hk")):
         return raw
 
     digits = "".join(ch for ch in raw if ch.isdigit())
@@ -346,6 +342,17 @@ def render_plain_line(line, width):
     return clipped + (' ' * max(width - text_display_width(clipped), 0))
 
 
+def make_xueqiu_url(code):
+    return f"https://xueqiu.com/S/{code}" if code else ""
+
+
+def make_terminal_hyperlink(label, url):
+    if not label or not url or not sys.stdout.isatty():
+        return label
+    # OSC 8 hyperlink (supported by iTerm2, modern terminals)
+    return f"\033]8;;{url}\a{label}\033]8;;\a"
+
+
 def format_row(row_data, layout, width, bold=False):
     parts = []
     for spec in layout:
@@ -367,6 +374,11 @@ def format_row(row_data, layout, width, bold=False):
         parts.append(align_text(value, spec['width'], spec['align']))
 
     plain_line = render_plain_line(' | '.join(parts), width)
+    code_text = str(row_data.get('code', ''))
+    if code_text and plain_line.startswith(code_text):
+        code_link = make_terminal_hyperlink(code_text, make_xueqiu_url(code_text))
+        plain_line = f"{code_link}{plain_line[len(code_text):]}"
+
     if bold:
         return f"{ANSI_BOLD}{plain_line}{ANSI_RESET}"
     return plain_line
