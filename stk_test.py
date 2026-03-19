@@ -2,25 +2,33 @@
 
 import time
 import os
-import platform
 import sys
 import csv
-import re
+import shutil
 import unicodedata
 from pathlib import Path
 import requests
+if os.name == 'nt':
+    import msvcrt
+else:
+    import select
+    import termios
 
 mystock = {}
 stock_codes = []
 stocks = ''
 url = "https://qt.gtimg.cn/q="
 previous_data = {}  # Store previous stock data for comparison
-first_run = True
-previous_display_rows = 0
+previous_terminal_size = None
+scroll_offset = 0
+last_fetch_ts = 0.0
+last_fetch_error = None
+TTY_FD = None
+TTY_OLD_SETTINGS = None
+ALT_SCREEN_ACTIVE = False
 
 ANSI_BOLD = '\033[1m'
 ANSI_RESET = '\033[0m'
-ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
 def normalize_stock_code(code):
@@ -159,10 +167,6 @@ def text_display_width(text):
     return width
 
 
-def strip_ansi(text):
-    return ANSI_ESCAPE_RE.sub('', text)
-
-
 def fit_text(text, width):
     result = []
     current = 0
@@ -185,11 +189,187 @@ def align_text(text, width, align='left'):
     return clipped + (' ' * pad)
 
 
-def pad_display_line(line, width):
-    visible_width = text_display_width(strip_ansi(line))
-    if visible_width >= width:
-        return line
-    return line + (' ' * (width - visible_width))
+def get_terminal_width():
+    try:
+        return shutil.get_terminal_size(fallback=(120, 30)).columns
+    except OSError:
+        return 120
+
+
+def get_terminal_height():
+    try:
+        return shutil.get_terminal_size(fallback=(120, 30)).lines
+    except OSError:
+        return 30
+
+
+def setup_tty_input():
+    global TTY_FD, TTY_OLD_SETTINGS
+    if os.name == 'nt' or not sys.stdin.isatty():
+        return
+
+    TTY_FD = sys.stdin.fileno()
+    TTY_OLD_SETTINGS = termios.tcgetattr(TTY_FD)
+    new_settings = termios.tcgetattr(TTY_FD)
+    new_settings[3] &= ~(termios.ICANON | termios.ECHO)
+    new_settings[6][termios.VMIN] = 0
+    new_settings[6][termios.VTIME] = 0
+    termios.tcsetattr(TTY_FD, termios.TCSANOW, new_settings)
+
+
+def restore_tty_input():
+    if os.name == 'nt' or TTY_FD is None or TTY_OLD_SETTINGS is None:
+        return
+    termios.tcsetattr(TTY_FD, termios.TCSANOW, TTY_OLD_SETTINGS)
+
+
+def read_key_nonblocking():
+    if os.name == 'nt':
+        if not msvcrt.kbhit():
+            return None
+        ch = msvcrt.getwch()
+        if ch in ('\x00', '\xe0'):
+            _ = msvcrt.getwch()
+            return None
+        if ch == 'f':
+            return 'PAGE_DOWN'
+        if ch == 'b':
+            return 'PAGE_UP'
+        if ch == 'g':
+            return 'TOP'
+        if ch == 'G':
+            return 'BOTTOM'
+        if ch in ('q', 'Q'):
+            return 'QUIT'
+        return None
+
+    if TTY_FD is None:
+        return None
+    if not select.select([sys.stdin], [], [], 0)[0]:
+        return None
+
+    ch = sys.stdin.read(1)
+    if ch == '\x1b':
+        if select.select([sys.stdin], [], [], 0.001)[0]:
+            _ = sys.stdin.read(1)
+            if select.select([sys.stdin], [], [], 0.001)[0]:
+                _ = sys.stdin.read(1)
+                if select.select([sys.stdin], [], [], 0.001)[0]:
+                    _ = sys.stdin.read(1)
+        return None
+
+    if ch == 'f':
+        return 'PAGE_DOWN'
+    if ch == 'b':
+        return 'PAGE_UP'
+    if ch == 'g':
+        return 'TOP'
+    if ch == 'G':
+        return 'BOTTOM'
+    if ch in ('q', 'Q'):
+        return 'QUIT'
+    return None
+
+
+def handle_keys(total_rows, view_rows):
+    global scroll_offset
+
+    should_quit = False
+    changed = False
+    max_offset = max(total_rows - view_rows, 0)
+
+    while True:
+        key = read_key_nonblocking()
+        if key is None:
+            break
+
+        if key == 'QUIT':
+            should_quit = True
+            break
+        if key == 'PAGE_DOWN':
+            step = max(view_rows - 1, 1)
+            scroll_offset = min(scroll_offset + step, max_offset)
+            changed = True
+        elif key == 'PAGE_UP':
+            step = max(view_rows - 1, 1)
+            scroll_offset = max(scroll_offset - step, 0)
+            changed = True
+        elif key == 'TOP':
+            scroll_offset = 0
+            changed = True
+        elif key == 'BOTTOM':
+            scroll_offset = max_offset
+            changed = True
+
+    return should_quit, changed
+
+
+def build_layout(max_width):
+    all_specs = {
+        'code': {'title': 'CODE', 'width': 10, 'min_width': 6, 'align': 'left'},
+        'name': {'title': 'NAME', 'width': 12, 'min_width': 4, 'align': 'left'},
+        'latest': {'title': 'LATEST', 'width': 10, 'min_width': 8, 'align': 'right'},
+        'change': {'title': 'CHANGE', 'width': 9, 'min_width': 7, 'align': 'right'},
+        'open': {'title': 'OPEN', 'width': 10, 'min_width': 7, 'align': 'right'},
+        'high': {'title': 'HIGH', 'width': 10, 'min_width': 7, 'align': 'right'},
+        'low': {'title': 'LOW', 'width': 10, 'min_width': 7, 'align': 'right'},
+    }
+    variants = [
+        ['code', 'name', 'latest', 'change', 'open', 'high', 'low'],
+        ['code', 'name', 'latest', 'change', 'open', 'high'],
+        ['code', 'name', 'latest', 'change', 'open'],
+        ['code', 'name', 'latest', 'change'],
+        ['code', 'name', 'latest'],
+        ['code', 'latest'],
+        ['code'],
+    ]
+
+    def calc_total_width(layout):
+        return sum(item['width'] for item in layout) + max(len(layout) - 1, 0) * 3
+
+    for keys in variants:
+        layout = [dict(all_specs[key], key=key) for key in keys]
+        while calc_total_width(layout) > max_width:
+            shrink_candidates = [item for item in layout if item['width'] > item['min_width']]
+            if not shrink_candidates:
+                break
+            target = max(shrink_candidates, key=lambda item: (item['width'] - item['min_width'], item['width']))
+            target['width'] -= 1
+        if calc_total_width(layout) <= max_width:
+            return layout
+
+    return [dict(all_specs['code'], key='code', width=max(4, max_width), min_width=4)]
+
+
+def render_plain_line(line, width):
+    clipped = fit_text(line, width)
+    return clipped + (' ' * max(width - text_display_width(clipped), 0))
+
+
+def format_row(row_data, layout, width, bold=False):
+    parts = []
+    for spec in layout:
+        key = spec['key']
+        if key == 'code':
+            value = row_data['code']
+        elif key == 'name':
+            value = row_data['name']
+        elif key == 'latest':
+            value = f"{row_data['latest_price']:.2f}"
+        elif key == 'change':
+            value = row_data['change_pct']
+        elif key == 'open':
+            value = f"{row_data['open_price']:.2f}"
+        elif key == 'high':
+            value = f"{row_data['high_price']:.2f}"
+        else:
+            value = f"{row_data['low_price']:.2f}"
+        parts.append(align_text(value, spec['width'], spec['align']))
+
+    plain_line = render_plain_line(' | '.join(parts), width)
+    if bold:
+        return f"{ANSI_BOLD}{plain_line}{ANSI_RESET}"
+    return plain_line
 
 
 def parseQtData(data_line):
@@ -227,21 +407,6 @@ def parseQtData(data_line):
         return None
 
 
-def clear_screen():
-    """Clear screen only once at startup"""
-    sysstr = platform.system()
-    if sysstr == 'Darwin' or sysstr == "Linux":
-        os.system("clear")
-    elif sysstr == 'Windows':
-        os.system("cls")
-
-
-def move_cursor_to_top():
-    """Move cursor to top of terminal without clearing"""
-    sys.stdout.write('\033[H')  # Move cursor to home position
-    sys.stdout.flush()
-
-
 def hide_cursor():
     """Hide cursor to reduce flicker"""
     sys.stdout.write('\033[?25l')
@@ -254,132 +419,181 @@ def show_cursor():
     sys.stdout.flush()
 
 
-def printStock():
-    global previous_data, first_run, previous_display_rows
-    
-    try:
-        # 每次刷新都重新读取：my_stock.dat + 当日 focus.csv
-        readData()
-        if not stocks:
-            return
+def enter_alternate_screen():
+    global ALT_SCREEN_ACTIVE
+    if not sys.stdout.isatty():
+        return
+    # 1049: switch to alternate buffer; preserve main scrollback/history.
+    sys.stdout.write('\033[?1049h\033[2J\033[H')
+    sys.stdout.flush()
+    ALT_SCREEN_ACTIVE = True
 
-        ctx = requests.get(url + stocks, timeout=10)
-        ctx.encoding = "gb2312"
-        data = ctx.text
-        
-        # Split by semicolon and newline
-        lines = data.replace(';', '\n').split('\n')
-        
-        current_data = {}
-        
-        # Parse all stock data first
-        for line in lines:
-            if not line.strip() or not line.startswith('v_'):
-                continue
-                
-            stock_data = parseQtData(line.strip())
-            if not stock_data:
-                continue
-                
-            try:
-                code = stock_data['code']
-                name = stock_data['name']
-                latest_price = float(stock_data['latest_price'])
-                prev_close = float(stock_data['prev_close'])
-                open_price = float(stock_data['open_price'])
-                high_price = float(stock_data['high_price'])
-                low_price = float(stock_data['low_price'])
-                change_pct_raw = stock_data['change_pct']
-                
-                # Handle suspended trading
-                if latest_price == 0:
-                    change_pct = "停牌"
-                    latest_price = prev_close
-                else:
+
+def leave_alternate_screen():
+    global ALT_SCREEN_ACTIVE
+    if not ALT_SCREEN_ACTIVE or not sys.stdout.isatty():
+        return
+    sys.stdout.write('\033[?1049l')
+    sys.stdout.flush()
+    ALT_SCREEN_ACTIVE = False
+
+
+def printStock(force_render=False):
+    global previous_data, previous_terminal_size
+    global scroll_offset, last_fetch_ts, last_fetch_error
+
+    terminal_width = get_terminal_width()
+    terminal_height = get_terminal_height()
+    safe_width = max(terminal_width - 1, 8)
+    layout = build_layout(safe_width)
+    table_width = min(
+        safe_width,
+        sum(spec['width'] for spec in layout) + max(len(layout) - 1, 0) * 3,
+    )
+    # Keep one spare line to avoid terminal scroll on the last newline.
+    view_rows = max(1, terminal_height - 5)  # header/separator/rows/time/status + 1 spare
+
+    existing_rows = [previous_data[code] for code in stock_codes if code in previous_data]
+    should_quit, input_changed = handle_keys(len(existing_rows), view_rows)
+    if should_quit:
+        return True
+
+    size_changed = (
+        previous_terminal_size is not None
+        and previous_terminal_size != (terminal_width, terminal_height)
+    )
+    if size_changed:
+        sys.stdout.write('\033[2J\033[H')
+        sys.stdout.flush()
+    previous_terminal_size = (terminal_width, terminal_height)
+
+    now = time.monotonic()
+    should_fetch = force_render or (now - last_fetch_ts >= 1.0)
+    if should_fetch:
+        last_fetch_ts = now
+        try:
+            # 每次行情刷新重新读取：my_stock.dat + 当日汇总 CSV
+            readData()
+            if not stocks:
+                previous_data = {}
+                last_fetch_error = "未加载到股票代码，请检查 my_stock.dat 与当日 CSV"
+            else:
+                ctx = requests.get(url + stocks, timeout=10)
+                ctx.encoding = "gb2312"
+                data = ctx.text
+                lines = data.replace(';', '\n').split('\n')
+                current_data = {}
+
+                for line in lines:
+                    if not line.strip() or not line.startswith('v_'):
+                        continue
+
+                    stock_data = parseQtData(line.strip())
+                    if not stock_data:
+                        continue
+
                     try:
-                        change_val = float(change_pct_raw)
-                        change_pct = f"{change_val:+.2f}%"
-                    except ValueError:
-                        change_pct = "N/A"
-                
-                stock_line = (
-                    f"{align_text(code, 10)} | "
-                    f"{align_text(name, 12)} | "
-                    f"{align_text(f'{latest_price:.2f}', 10, 'right')} | "
-                    f"{align_text(change_pct, 9, 'right')} | "
-                    f"{align_text(f'{open_price:.2f}', 10, 'right')} | "
-                    f"{align_text(f'{high_price:.2f}', 10, 'right')} | "
-                    f"{align_text(f'{low_price:.2f}', 10, 'right')}"
-                )
+                        code = stock_data['code']
+                        name = stock_data['name']
+                        latest_price = float(stock_data['latest_price'])
+                        prev_close = float(stock_data['prev_close'])
+                        open_price = float(stock_data['open_price'])
+                        high_price = float(stock_data['high_price'])
+                        low_price = float(stock_data['low_price'])
+                        change_pct_raw = stock_data['change_pct']
 
-                if latest_price > prev_close:
-                    stock_line = f"{ANSI_BOLD}{stock_line}{ANSI_RESET}"
-                
-                current_data[code] = stock_line
-                
-            except (ValueError, KeyError) as e:
-                print(f"Error processing stock {stock_data.get('code', 'unknown')}: {e}")
-                continue
-        
-        # Move cursor to top instead of clearing screen
-        if not first_run:
-            move_cursor_to_top()
-        
-        # Print header and time
-        header = (
-            f"{align_text('CODE', 10)} | "
-            f"{align_text('NAME', 12)} | "
-            f"{align_text('LATEST', 10, 'right')} | "
-            f"{align_text('CHANGE', 9, 'right')} | "
-            f"{align_text('OPEN', 10, 'right')} | "
-            f"{align_text('HIGH', 10, 'right')} | "
-            f"{align_text('LOW', 10, 'right')}"
-        )
-        separator = "-+-".join(['-' * 10, '-' * 12, '-' * 10, '-' * 9, '-' * 10, '-' * 10, '-' * 10])
-        time_line = f"Time: {getTime()} | Total: {len(stock_codes)}"
-        table_width = max(text_display_width(header), text_display_width(separator), text_display_width(time_line))
-        
-        print(pad_display_line(time_line, table_width))
-        print(pad_display_line(header, table_width))
-        print(pad_display_line(separator, table_width))
-        
-        # Print stock data
-        rendered_rows = 0
-        for code in stock_codes:
-            stock_line = current_data.get(code)
-            if not stock_line:
-                continue
-            print(pad_display_line(stock_line, table_width))
-            rendered_rows += 1
-        
-        if not first_run and previous_display_rows > rendered_rows:
-            for _ in range(previous_display_rows - rendered_rows):
-                print(" " * table_width)
-        
-        previous_display_rows = rendered_rows
-        previous_data = current_data
-        first_run = False
-        
-    except requests.RequestException as e:
-        print(f"Network error: {e}")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
+                        if latest_price == 0:
+                            change_pct = "停牌"
+                            latest_price = prev_close
+                        else:
+                            try:
+                                change_val = float(change_pct_raw)
+                                change_pct = f"{change_val:+.2f}%"
+                            except ValueError:
+                                change_pct = "N/A"
+
+                        current_data[code] = {
+                            'code': code,
+                            'name': name,
+                            'latest_price': latest_price,
+                            'change_pct': change_pct,
+                            'open_price': open_price,
+                            'high_price': high_price,
+                            'low_price': low_price,
+                            'is_up': latest_price > prev_close,
+                        }
+                    except (ValueError, KeyError):
+                        continue
+
+                previous_data = current_data
+                last_fetch_error = None
+        except requests.RequestException as e:
+            last_fetch_error = f"Network error: {e}"
+        except Exception as e:
+            last_fetch_error = f"Unexpected error: {e}"
+
+    ordered_rows = [previous_data[code] for code in stock_codes if code in previous_data]
+    max_offset = max(len(ordered_rows) - view_rows, 0)
+    scroll_offset = min(max(scroll_offset, 0), max_offset)
+
+    if not (force_render or size_changed or should_fetch or input_changed):
+        return False
+
+    start_index = scroll_offset
+    end_index = min(start_index + view_rows, len(ordered_rows))
+    visible_rows = ordered_rows[start_index:end_index]
+
+    # Some consoles partially support ANSI; use full-screen clear + home
+    # to avoid stale header lines when redrawing.
+    sys.stdout.write('\033[2J\033[H')
+    sys.stdout.flush()
+
+    header_parts = [align_text(spec['title'], spec['width'], spec['align']) for spec in layout]
+    header = render_plain_line(' | '.join(header_parts), table_width)
+    separator = render_plain_line('-+-'.join(['-' * spec['width'] for spec in layout]), table_width)
+    range_text = f"{start_index + 1}-{end_index}/{len(ordered_rows)}" if ordered_rows else "0/0"
+    time_line = render_plain_line(f"Time: {getTime()} | View: {range_text}", table_width)
+    print(header)
+    print(separator)
+
+    if visible_rows:
+        for row_data in visible_rows:
+            print(format_row(row_data, layout, table_width, bold=row_data['is_up']))
+    else:
+        print(render_plain_line("暂无可显示行情数据", table_width))
+    print(time_line)
+
+    if last_fetch_error:
+        status = f"{last_fetch_error} | f/b:翻页 g/G:首尾 q:退出"
+    else:
+        status = "f/b:翻页  g/G:首尾  q:退出"
+    print(render_plain_line(status, table_width))
+
+    return False
 
 
 if __name__ == '__main__':
+    exit_code = 0
+    exit_message = "\n程序已退出"
     try:
-        clear_screen()  # Clear screen only once at startup
+        enter_alternate_screen()
+        setup_tty_input()
         hide_cursor()   # Hide cursor to reduce flicker
         
         while True:
-            printStock()
-            time.sleep(1)  # Slightly longer interval for smoother updates
+            should_quit = printStock()
+            if should_quit:
+                break
+            time.sleep(0.05)  # 高频轮询输入，低频拉行情由 printStock 内部控制
             
     except KeyboardInterrupt:
-        show_cursor()  # Show cursor before exit
-        print("\n程序已退出")
-        sys.exit(0)
+        pass
     except Exception as e:
+        exit_code = 1
+        exit_message = f"\n程序错误: {e}"
+    finally:
+        restore_tty_input()
         show_cursor()
-        print(f"\n程序错误: {e}")
-        sys.exit(1)
+        leave_alternate_screen()
+        print(exit_message)
+        sys.exit(exit_code)
