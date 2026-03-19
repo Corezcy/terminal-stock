@@ -4,9 +4,12 @@ import time
 import os
 import platform
 import sys
+import csv
+from pathlib import Path
 import requests
 
 mystock = {}
+stock_codes = []
 stocks = ''
 url = "https://qt.gtimg.cn/q="
 previous_data = {}  # Store previous stock data for comparison
@@ -30,31 +33,125 @@ class bcolors:
         self.RED = ''
         self.ENDC = ''
 
+
+def normalize_stock_code(code):
+    """Normalize stock code to formats like sh600000 / sz000001 / bj430047."""
+    raw = str(code).strip().lower()
+    if not raw:
+        return ""
+
+    if raw.startswith(("sh", "sz", "bj")):
+        prefix = raw[:2]
+        digits = raw[2:]
+        if digits.isdigit():
+            return f"{prefix}{digits.zfill(6)}"
+        return raw
+
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return raw
+
+    digits = digits.zfill(6)
+    if digits.startswith(("6", "9")):
+        return f"sh{digits}"
+    if digits.startswith(("0", "2", "3")):
+        return f"sz{digits}"
+    if digits.startswith(("4", "8")):
+        return f"bj{digits}"
+    return digits
+
+
+def get_today_focus_csv_path():
+    today = time.strftime("%Y%m%d", time.localtime())
+    relative_path = Path(f"stock_changes_{today}") / f"stock_changes_summary_{today}_focus.csv"
+
+    current_dir = Path(__file__).resolve().parent
+    project_dir = current_dir.parent
+    candidates = [
+        current_dir / relative_path,
+        project_dir / relative_path,
+        project_dir / "AKShare" / relative_path,
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_my_stock_codes(stock_file_path):
+    my_codes = []
+    seen_codes = set()
+    mystock.clear()
+
+    with open(stock_file_path, 'r', encoding='utf-8') as f:
+        stock_list = f.read().split('\n')
+
+    for item in stock_list:
+        if item.startswith('#'):
+            continue
+        if item.strip() == '':
+            continue
+
+        item_list = item.split()
+        if len(item_list) < 1:
+            continue
+
+        code = normalize_stock_code(item_list[0])
+        if not code or code in seen_codes:
+            continue
+
+        seen_codes.add(code)
+        my_codes.append(code)
+        mystock[code] = (item_list[1], item_list[2]) if len(item_list) == 3 else None
+
+    return my_codes
+
+
+def load_focus_stock_codes():
+    focus_codes = []
+    seen_codes = set()
+    focus_path = get_today_focus_csv_path()
+    if not focus_path:
+        return focus_codes
+
+    with open(focus_path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            code = normalize_stock_code(row.get("代码", ""))
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            focus_codes.append(code)
+
+    return focus_codes
+
+
 def readData():
-    # 获取当前脚本文件的绝对路径
-    current_file = os.path.abspath(__file__)
-    # 获取当前脚本所在的目录
-    current_dir = os.path.dirname(current_file)
-    # 构建 my_stock.dat 的完整路径
-    stock_file_path = os.path.join(current_dir, 'my_stock.dat')
-    
-    global stocks, mystock
-    
+    global stocks, stock_codes
+
+    current_dir = Path(__file__).resolve().parent
+    stock_file_path = current_dir / 'my_stock.dat'
+
     try:
-        with open(stock_file_path, 'r', encoding='utf-8') as f:
-            stockList = f.read().split('\n')
-            
-        for item in stockList:
-            if item.startswith('#'):
-                continue  # 跳过注释行
-            if item.strip() != '':  # 使用 strip() 去除空白字符
-                itemList = item.split()
-                if len(itemList) >= 1:
-                    stocks += itemList[0] + ','
-                    mystock[itemList[0]] = (itemList[1], itemList[2]) if len(itemList) == 3 else None
-        
-        stocks = stocks[:-1]  # 去掉最后一个逗号
-        
+        my_codes = load_my_stock_codes(stock_file_path)
+        focus_codes = load_focus_stock_codes()
+
+        merged_codes = []
+        seen_codes = set()
+
+        # my_stock.dat 永远优先，focus 文件只补充未出现的代码
+        for code in my_codes + focus_codes:
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                merged_codes.append(code)
+
+        stock_codes = merged_codes
+        stocks = ",".join(stock_codes)
+
+        if not stocks:
+            print("未加载到任何股票代码，请检查 my_stock.dat 或当日 focus CSV")
+
     except FileNotFoundError:
         print(f"文件未找到: {stock_file_path}")
         print(f"当前工作目录: {os.getcwd()}")
@@ -136,6 +233,11 @@ def printStock():
     global previous_data, first_run
     
     try:
+        # 每次刷新都重新读取：my_stock.dat + 当日 focus.csv
+        readData()
+        if not stocks:
+            return
+
         ctx = requests.get(url + stocks, timeout=10)
         ctx.encoding = "gb2312"
         data = ctx.text
@@ -144,7 +246,6 @@ def printStock():
         lines = data.replace(';', '\n').split('\n')
         
         current_data = {}
-        stock_lines = []
         
         # Parse all stock data first
         for line in lines:
@@ -197,7 +298,6 @@ def printStock():
                 )
                 
                 current_data[code] = stock_line
-                stock_lines.append((code, stock_line))
                 
             except (ValueError, KeyError) as e:
                 print(f"Error processing stock {stock_data.get('code', 'unknown')}: {e}")
@@ -217,7 +317,10 @@ def printStock():
         print(f"{separator:<120}")
         
         # Print stock data
-        for code, stock_line in stock_lines:
+        for code in stock_codes:
+            stock_line = current_data.get(code)
+            if not stock_line:
+                continue
             # Add padding to ensure line is fully overwritten
             padded_line = f"{stock_line:<120}"
             print(padded_line)
@@ -241,7 +344,6 @@ def printStock():
 
 if __name__ == '__main__':
     try:
-        readData()
         clear_screen()  # Clear screen only once at startup
         hide_cursor()   # Hide cursor to reduce flicker
         
