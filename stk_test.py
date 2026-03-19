@@ -5,6 +5,8 @@ import os
 import platform
 import sys
 import csv
+import re
+import unicodedata
 from pathlib import Path
 import requests
 
@@ -14,24 +16,11 @@ stocks = ''
 url = "https://qt.gtimg.cn/q="
 previous_data = {}  # Store previous stock data for comparison
 first_run = True
+previous_display_rows = 0
 
-
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    WHITE = '\033[97m'
-    ENDC = '\033[0m'
-
-    def disable(self):
-        self.HEADER = ''
-        self.OKBLUE = ''
-        self.GREEN = ''
-        self.YELLOW = ''
-        self.RED = ''
-        self.ENDC = ''
+ANSI_BOLD = '\033[1m'
+ANSI_RESET = '\033[0m'
+ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 
 def normalize_stock_code(code):
@@ -163,8 +152,44 @@ def getTime():
     return time.strftime('%Y-%m-%d %A %p %X', time.localtime(time.time()))
 
 
-def highOrLow(a, b):
-    return bcolors.RED if a >= b else bcolors.GREEN
+def text_display_width(text):
+    width = 0
+    for ch in str(text):
+        width += 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+    return width
+
+
+def strip_ansi(text):
+    return ANSI_ESCAPE_RE.sub('', text)
+
+
+def fit_text(text, width):
+    result = []
+    current = 0
+    for ch in str(text):
+        ch_width = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+        if current + ch_width > width:
+            break
+        result.append(ch)
+        current += ch_width
+    return ''.join(result)
+
+
+def align_text(text, width, align='left'):
+    clipped = fit_text(text, width)
+    pad = width - text_display_width(clipped)
+    if pad <= 0:
+        return clipped
+    if align == 'right':
+        return (' ' * pad) + clipped
+    return clipped + (' ' * pad)
+
+
+def pad_display_line(line, width):
+    visible_width = text_display_width(strip_ansi(line))
+    if visible_width >= width:
+        return line
+    return line + (' ' * (width - visible_width))
 
 
 def parseQtData(data_line):
@@ -230,7 +255,7 @@ def show_cursor():
 
 
 def printStock():
-    global previous_data, first_run
+    global previous_data, first_run, previous_display_rows
     
     try:
         # 每次刷新都重新读取：my_stock.dat + 当日 focus.csv
@@ -258,44 +283,37 @@ def printStock():
                 
             try:
                 code = stock_data['code']
-                name = stock_data['name'][:8]  # Limit name length for display
+                name = stock_data['name']
                 latest_price = float(stock_data['latest_price'])
                 prev_close = float(stock_data['prev_close'])
                 open_price = float(stock_data['open_price'])
                 high_price = float(stock_data['high_price'])
                 low_price = float(stock_data['low_price'])
-                change_pct = stock_data['change_pct']
+                change_pct_raw = stock_data['change_pct']
                 
                 # Handle suspended trading
                 if latest_price == 0:
                     change_pct = "停牌"
                     latest_price = prev_close
                 else:
-                    # Format change percentage
                     try:
-                        change_val = float(change_pct)
+                        change_val = float(change_pct_raw)
                         change_pct = f"{change_val:+.2f}%"
-                    except:
+                    except ValueError:
                         change_pct = "N/A"
                 
-                # Color coding based on price movement
-                latest_color = highOrLow(latest_price, prev_close)
-                open_color = highOrLow(open_price, prev_close)
-                high_color = highOrLow(high_price, prev_close)
-                low_color = highOrLow(low_price, prev_close)
-                change_color = bcolors.RED if latest_price >= prev_close else bcolors.GREEN
-                
-                # Create formatted line
                 stock_line = (
-                    f"{bcolors.WHITE}{code:<12}{bcolors.ENDC} "
-                    f"{bcolors.WHITE}{name:<12}{bcolors.ENDC} "
-                    # f"{bcolors.WHITE}{prev_close:>10.2f}{bcolors.ENDC} "
-                    # f"{open_color}{open_price:>10.2f}{bcolors.ENDC} "
-                    # f"{high_color}{high_price:>10.2f}{bcolors.ENDC} "
-                    # f"{low_color}{low_price:>10.2f}{bcolors.ENDC} "
-                    f"{latest_color}{latest_price:>10.2f}{bcolors.ENDC} "
-                    f"{change_color}{change_pct:>10s}{bcolors.ENDC}"
+                    f"{align_text(code, 10)} | "
+                    f"{align_text(name, 12)} | "
+                    f"{align_text(f'{latest_price:.2f}', 10, 'right')} | "
+                    f"{align_text(change_pct, 9, 'right')} | "
+                    f"{align_text(f'{open_price:.2f}', 10, 'right')} | "
+                    f"{align_text(f'{high_price:.2f}', 10, 'right')} | "
+                    f"{align_text(f'{low_price:.2f}', 10, 'right')}"
                 )
+
+                if latest_price > prev_close:
+                    stock_line = f"{ANSI_BOLD}{stock_line}{ANSI_RESET}"
                 
                 current_data[code] = stock_line
                 
@@ -308,38 +326,44 @@ def printStock():
             move_cursor_to_top()
         
         # Print header and time
-        time_str = bcolors.YELLOW + getTime() + bcolors.ENDC
-        header = bcolors.WHITE + "CODE         NAME                 LATEST      CHANGE" + bcolors.ENDC
-        separator = bcolors.WHITE + "=" * 55 + bcolors.ENDC
+        header = (
+            f"{align_text('CODE', 10)} | "
+            f"{align_text('NAME', 12)} | "
+            f"{align_text('LATEST', 10, 'right')} | "
+            f"{align_text('CHANGE', 9, 'right')} | "
+            f"{align_text('OPEN', 10, 'right')} | "
+            f"{align_text('HIGH', 10, 'right')} | "
+            f"{align_text('LOW', 10, 'right')}"
+        )
+        separator = "-+-".join(['-' * 10, '-' * 12, '-' * 10, '-' * 9, '-' * 10, '-' * 10, '-' * 10])
+        time_line = f"Time: {getTime()} | Total: {len(stock_codes)}"
+        table_width = max(text_display_width(header), text_display_width(separator), text_display_width(time_line))
         
-        print(f"{time_str:<120}")  # Fixed width to overwrite previous time
-        print(f"{header:<120}")
-        print(f"{separator:<120}")
+        print(pad_display_line(time_line, table_width))
+        print(pad_display_line(header, table_width))
+        print(pad_display_line(separator, table_width))
         
         # Print stock data
+        rendered_rows = 0
         for code in stock_codes:
             stock_line = current_data.get(code)
             if not stock_line:
                 continue
-            # Add padding to ensure line is fully overwritten
-            padded_line = f"{stock_line:<120}"
-            print(padded_line)
+            print(pad_display_line(stock_line, table_width))
+            rendered_rows += 1
         
-        # Clear any remaining lines from previous output
-        if not first_run:
-            # Print empty lines to clear any leftover content
-            for _ in range(3):
-                print(" " * 120)
+        if not first_run and previous_display_rows > rendered_rows:
+            for _ in range(previous_display_rows - rendered_rows):
+                print(" " * table_width)
         
+        previous_display_rows = rendered_rows
         previous_data = current_data
         first_run = False
         
     except requests.RequestException as e:
-        error_msg = f"{bcolors.RED}Network error: {e}{bcolors.ENDC}"
-        print(f"{error_msg:<120}")
+        print(f"Network error: {e}")
     except Exception as e:
-        error_msg = f"{bcolors.RED}Unexpected error: {e}{bcolors.ENDC}"
-        print(f"{error_msg:<120}")
+        print(f"Unexpected error: {e}")
 
 
 if __name__ == '__main__':
@@ -353,9 +377,9 @@ if __name__ == '__main__':
             
     except KeyboardInterrupt:
         show_cursor()  # Show cursor before exit
-        print(f"\n{bcolors.YELLOW}程序已退出{bcolors.ENDC}")
+        print("\n程序已退出")
         sys.exit(0)
     except Exception as e:
         show_cursor()
-        print(f"\n{bcolors.RED}程序错误: {e}{bcolors.ENDC}")
+        print(f"\n程序错误: {e}")
         sys.exit(1)
