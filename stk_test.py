@@ -32,17 +32,36 @@ ANSI_RESET = '\033[0m'
 
 
 def normalize_stock_code(code):
-    """Normalize stock code to formats like sh600000 / sz000001 / bj430047."""
-    raw = str(code).strip().lower()
+    """Normalize stock code to formats like sh600000 / hk00700 / usCRWV."""
+    raw = str(code).strip()
     if not raw:
         return ""
 
-    if raw.startswith(("sh", "sz", "bj", "hk")):
-        return raw
+    raw_lower = raw.lower()
+    if raw_lower.startswith("us"):
+        # 美股：前缀 us 小写，后缀代码统一大写
+        symbol = raw[2:].strip()
+        if not symbol:
+            return "us"
+        return f"us{symbol.upper()}"
 
-    digits = "".join(ch for ch in raw if ch.isdigit())
+    if raw_lower.startswith("hk"):
+        # 港股：固定 5 位数字代码
+        digits = "".join(ch for ch in raw[2:] if ch.isdigit())
+        if digits:
+            return f"hk{digits.zfill(5)}"
+        return "hk"
+
+    if raw_lower.startswith(("sh", "sz", "bj")):
+        prefix = raw_lower[:2]
+        digits = "".join(ch for ch in raw[2:] if ch.isdigit())
+        if digits:
+            return f"{prefix}{digits.zfill(6)}"
+        return raw_lower
+
+    digits = "".join(ch for ch in raw_lower if ch.isdigit())
     if not digits:
-        return raw
+        return raw_lower
 
     digits = digits.zfill(6)
     if digits.startswith(("6", "9")):
@@ -403,8 +422,12 @@ def parseQtData(data_line):
         if len(fields) < 36:  # Need at least 36 fields for our required data
             return None
             
+        parsed_code = normalize_stock_code(parts[0].replace('v_', '').strip())
+        if not parsed_code:
+            return None
+
         return {
-            'code': parts[0].replace('v_', ''),  # Extract code from v_sh000001
+            'code': parsed_code,         # 标准化代码（兼容 hk/us 大小写）
             'name': fields[1],          # 合约名称 - field 2
             'contract_id': fields[2],   # 合约ID - field 3  
             'latest_price': fields[3],  # 最新价 - field 4
