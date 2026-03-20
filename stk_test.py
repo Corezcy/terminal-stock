@@ -362,7 +362,14 @@ def render_plain_line(line, width):
 
 
 def make_xueqiu_url(code):
-    return f"https://xueqiu.com/S/{code}" if code else ""
+    if not code:
+        return ""
+    normalized = normalize_stock_code(code)
+    if normalized.startswith(("hk", "us")) and len(normalized) > 2:
+        symbol = normalized[2:]
+    else:
+        symbol = normalized
+    return f"https://xueqiu.com/S/{symbol}" if symbol else ""
 
 
 def make_terminal_hyperlink(label, url):
